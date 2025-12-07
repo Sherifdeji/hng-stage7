@@ -10,6 +10,7 @@ import {
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { DocumentsService } from './documents.service';
+import { UploadResponseDto } from '../dto/upload-response.dto';
 
 @Controller('documents')
 export class DocumentsController {
@@ -31,8 +32,17 @@ export class DocumentsController {
         }),
     )
     file: Express.Multer.File,
-  ) {
-    return this.documentsService.uploadFile(file);
+  ): Promise<UploadResponseDto> {
+    const document = await this.documentsService.uploadFile(file);
+
+    // Return only necessary fields
+    return {
+      id: document.id,
+      originalFilename: document.originalFilename,
+      mimeType: document.mimeType,
+      s3Key: document.s3Key,
+      createdAt: document.createdAt,
+    };
   }
 
   @Post(':id/analyze')

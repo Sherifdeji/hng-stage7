@@ -1,21 +1,30 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  InternalServerErrorException,
+  BadRequestException,
+  Logger,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Document } from './document.entity';
 import * as Minio from 'minio';
-import axios from 'axios';
 import * as mammoth from 'mammoth';
-import pdfParse from 'pdf-parse';
+import { HttpService } from '@nestjs/axios';
+import { firstValueFrom } from 'rxjs';
+import { v4 as uuidv4 } from 'uuid';
 
 @Injectable()
 export class DocumentsService {
   private minioClient: Minio.Client;
+  private readonly logger = new Logger(DocumentsService.name);
 
   constructor(
     @InjectRepository(Document)
-    private docsRepo: Repository<Document>,
-    private configService: ConfigService,
+    private readonly docsRepo: Repository<Document>,
+    private readonly configService: ConfigService,
+    private readonly httpService: HttpService,
   ) {
     const minioEndpoint = this.configService.get<string>('MINIO_ENDPOINT');
     const minioPort = this.configService.get<number>('MINIO_PORT');
@@ -49,23 +58,29 @@ export class DocumentsService {
     const exists = await this.minioClient.bucketExists(bucketName);
     if (!exists) await this.minioClient.makeBucket(bucketName, 'us-east-1');
 
-    // Upload to MinIO
-    const s3Key = `${Date.now()}-${file.originalname}`;
+    const sanitizedFilename = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '');
+    const s3Key = `${uuidv4()}-${sanitizedFilename}`;
     await this.minioClient.putObject(bucketName, s3Key, file.buffer);
 
-    // Basic Text Extraction (PDF)
     let extractedText = '';
-    if (file.mimetype === 'application/pdf') {
-      const pdfData = await pdfParse(file.buffer);
-      extractedText = pdfData.text;
-    } else if (
-      file.mimetype ===
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-    ) {
-      const data = await mammoth.extractRawText({ buffer: file.buffer });
-      extractedText = data.value;
-    } else {
-      extractedText = 'Text extraction pending or not supported for this type.';
+    try {
+      if (file.mimetype === 'application/pdf') {
+        // For PDFs, text extraction is deferred to the AI analysis step
+        extractedText = 'Text extraction will be performed by AI.';
+      } else if (
+        file.mimetype ===
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+      ) {
+        const { value } = await mammoth.extractRawText({ buffer: file.buffer });
+        extractedText = value;
+      } else {
+        extractedText = 'Text extraction not supported for this file type.';
+      }
+    } catch (error) {
+      this.logger.error(
+        `Failed to extract text from ${file.originalname}: ${error.message}`,
+      );
+      extractedText = 'Error during local text extraction.';
     }
 
     // Save initial record to DB
@@ -79,33 +94,79 @@ export class DocumentsService {
     return this.docsRepo.save(doc);
   }
 
-  // 2. Analyze with LLM
+  // 2. Analyze with LLM using OpenRouter's Universal PDF Support
   async analyzeDocument(id: string) {
-    const doc = await this.docsRepo.findOne({ where: { id } });
+    const doc = await this.docsRepo.findOneBy({ id });
     if (!doc) throw new NotFoundException('Document not found');
 
-    if (!doc.extractedText || doc.extractedText.length < 10) {
-      throw new Error('No text content to analyze');
+    // For non-PDFs, check if there's text to analyze
+    if (
+      doc.mimeType !== 'application/pdf' &&
+      (!doc.extractedText || doc.extractedText.length < 10)
+    ) {
+      throw new BadRequestException(
+        'Document has no text content or content is too short to be analyzed.',
+      );
     }
 
-    // Call OpenRouter
-    const prompt = `
-      Analyze the following document text:
-      "${doc.extractedText.substring(0, 10000)}..." 
-      
-      Return a JSON object with:
-      - summary: A concise summary.
-      - type: Document type (Invoice, CV, etc).
-      - attributes: Key extracted metadata (dates, names, amounts).
-    `;
+    const bucketName =
+      this.configService.get<string>('MINIO_BUCKET') || 'documents';
 
     try {
-      const response = await axios.post(
+      // Fetch the file from MinIO
+      const fileStream = await this.minioClient.getObject(
+        bucketName,
+        doc.s3Key,
+      );
+      const fileBuffer = await new Promise<Buffer>((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        fileStream.on('data', (chunk) => chunks.push(chunk));
+        fileStream.on('error', reject);
+        fileStream.on('end', () => resolve(Buffer.concat(chunks)));
+      });
+
+      // Base64 encode the file buffer
+      const base64File = `data:${doc.mimeType};base64,${fileBuffer.toString('base64')}`;
+
+      const promptText = `
+      Analyze the attached document and extract its full text content.
+      Based on the content, return a single, valid JSON object with the following structure:
+      - "extractedText": "The full, raw text content of the document."
+      - "summary": "A concise 2-3 sentence summary of the document."
+      - "type": "The type of document (e.g., 'Invoice', 'Resume', 'Contract', 'Report')."
+      - "attributes": "An object containing key extracted metadata (like dates, names, amounts, etc.)."
+
+      Extract relevant metadata in attributes based on document type.
+      `.trim();
+
+      const response$ = this.httpService.post(
         'https://openrouter.ai/api/v1/chat/completions',
         {
-          model: 'google/gemini-2.5-flash-001',
-          messages: [{ role: 'user', content: prompt }],
-          response_format: { type: 'json_object' },
+          model: 'google/gemini-2.5-flash',
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: promptText },
+                {
+                  type: 'file',
+                  file: {
+                    filename: doc.originalFilename,
+                    file_data: base64File,
+                  },
+                },
+              ],
+            },
+          ],
+          // Add PDF processing engine configuration
+          plugins: [
+            {
+              id: 'file-parser',
+              pdf: {
+                engine: 'pdf-text', // Using pdf-text engine
+              },
+            },
+          ],
         },
         {
           headers: {
@@ -115,24 +176,54 @@ export class DocumentsService {
         },
       );
 
+      const response = await firstValueFrom(response$);
       const content = response.data.choices[0].message.content;
-      const cleanContent = content.replace(/```json\n?|```/g, '').trim();
-      const result = JSON.parse(cleanContent);
 
-      // Update DB
-      doc.summary = result.summary;
-      doc.documentType = result.type;
-      doc.metadata = result.attributes;
+      try {
+        const cleanContent = content.replace(/```json\n?|```/g, '').trim();
+        const result = JSON.parse(cleanContent);
 
-      return this.docsRepo.save(doc);
+        // Update the document with all the new info from the AI
+        doc.extractedText = result.extractedText;
+        doc.summary = result.summary;
+        doc.documentType = result.type;
+        doc.metadata = result.attributes;
+
+        this.logger.log(
+          `Successfully analyzed document ${id}. Type: ${doc.documentType}`,
+        );
+
+        return this.docsRepo.save(doc);
+      } catch (parseError) {
+        this.logger.error(`Failed to parse AI response: ${parseError.message}`);
+        throw new InternalServerErrorException('Failed to parse AI response.');
+      }
     } catch (error) {
-      console.error('LLM Error', error);
-      throw new Error('Failed to analyze document with AI');
+      const errorMessage =
+        error.response?.data?.error?.message || error.message;
+      this.logger.error(
+        `Failed to analyze document ${id}: ${errorMessage}`,
+        error.stack,
+      );
+
+      if (error.response?.status === 402) {
+        throw new InternalServerErrorException(
+          'OpenRouter API credit limit reached. Please check your account.',
+        );
+      }
+
+      throw new InternalServerErrorException(
+        `Failed to analyze document: ${errorMessage}`,
+      );
     }
   }
 
   // 3. Get Document
   async findOne(id: string) {
-    return this.docsRepo.findOne({ where: { id } });
+    const doc = await this.docsRepo.findOneBy({ id });
+    if (!doc) {
+      throw new NotFoundException(`Document with ID "${id}" not found`);
+    }
+    return doc;
   }
 }
